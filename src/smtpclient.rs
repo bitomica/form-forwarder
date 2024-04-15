@@ -1,11 +1,13 @@
 use crate::config::ServerConfig;
 use base64::prelude::*;
-use native_tls::TlsConnector as NativeTlsConnector;
+use rustls_pki_types;
+use std::io;
+use std::sync::Arc;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::BufReader;
-use tokio::io::{AsyncWriteExt, BufWriter};
+use tokio::io::{AsyncWriteExt, BufWriter, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
-use tokio_native_tls::TlsConnector;
+use tokio_rustls::{client::TlsStream, rustls, TlsConnector};
 
 #[derive(Debug)]
 pub enum SMTPClientError {
@@ -20,8 +22,8 @@ pub enum SMTPClientError {
 #[derive(Debug)]
 pub struct SMTPClient {
     config: ServerConfig,
-    reader: Option<BufReader<tokio::io::ReadHalf<tokio_native_tls::TlsStream<TcpStream>>>>,
-    writer: Option<BufWriter<tokio::io::WriteHalf<tokio_native_tls::TlsStream<TcpStream>>>>,
+    reader: Option<BufReader<ReadHalf<TlsStream<TcpStream>>>>,
+    writer: Option<BufWriter<WriteHalf<TlsStream<TcpStream>>>>,
     buffer: String,
 }
 
@@ -36,14 +38,21 @@ impl SMTPClient {
     }
 
     pub async fn connect(&mut self) -> Result<&Self, SMTPClientError> {
-        let cx = NativeTlsConnector::builder()
-            .danger_accept_invalid_certs(true)
-            .build()
-            .unwrap();
-        let cx = TlsConnector::from(cx);
+        let mut root_cert_store = rustls::RootCertStore::empty();
+        root_cert_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+        let config = rustls::ClientConfig::builder()
+            .with_root_certificates(root_cert_store)
+            .with_no_client_auth();
+        let connector = TlsConnector::from(Arc::new(config));
         let addr = format!("{}:{}", self.config.smtp_server, self.config.smtp_port);
         let stream = TcpStream::connect(addr.clone()).await.unwrap();
-        let stream = cx.connect(addr.as_str(), stream).await.unwrap();
+
+        let domain = rustls_pki_types::ServerName::try_from(self.config.smtp_domain.as_str())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid dnsname"))
+            .unwrap()
+            .to_owned();
+        let stream = connector.connect(domain, stream).await.unwrap();
 
         let (reader, writer) = tokio::io::split(stream);
         let mut reader = BufReader::new(reader);
